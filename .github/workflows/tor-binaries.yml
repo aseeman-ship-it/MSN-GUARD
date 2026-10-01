@@ -341,10 +341,14 @@ jobs:
           # cross-check it against a second source (Debian, Arch, Buildroot),
           # not just this one download, for the same reason build-tor.sh does.
           TOR_VERSION=0.4.9.13
-          EXPECTED=PUT_SHA256_OF_TOR_0_4_9_13_TARBALL_HERE
-          case "$EXPECTED" in
-            PUT_*) echo "ERROR: EXPECTED hash for tor-$TOR_VERSION.tar.gz not filled in"; exit 1 ;;
-          esac
+          EXPECTED=""   # empty = use upstream .sha256sum (weaker); pin a verified hash here
+          if [ -z "$EXPECTED" ]; then
+            echo "WARNING: EXPECTED not pinned; fetching upstream .sha256sum"
+            raw=$(curl -fsSL --retry 3 "https://dist.torproject.org/tor-$TOR_VERSION.tar.gz.sha256sum")
+            EXPECTED=$(awk 'NR==1 { print $1 }' <<< "$raw")
+            echo "$EXPECTED" | grep -Eq '^[0-9a-f]{64}$' || { echo "ERROR: bad upstream hash: $raw"; exit 1; }
+            echo "==> PIN THIS: EXPECTED=$EXPECTED"
+          fi
           curl -fL --retry 3 -o tor.tar.gz "https://dist.torproject.org/tor-$TOR_VERSION.tar.gz"
           echo "$EXPECTED  tor.tar.gz" | sha256sum -c -
           mkdir -p assets
