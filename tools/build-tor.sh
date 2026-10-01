@@ -53,22 +53,37 @@ elf_type() {
 show_disk() { echo "--- disk: $* ---"; df -h / /home 2>/dev/null | sed 's/^/    /'; }
 
 # --- Pinned versions ---
-TOR_VERSION=0.4.9.11
+# TOR_VERSION must move together with TOR_VERSION + EXPECTED in the geoip job of
+# .github/workflows/tor-binaries.yml (the geoip files come from the same
+# tarball). Tor is currently on a ~2-3 week security-release cadence, so check
+# https://forum.torproject.org (Release Announcements) before each rebuild.
+TOR_VERSION=0.4.9.13
 OPENSSL_VERSION=3.5.4
 LIBEVENT_VERSION=2.1.12
 ZLIB_VERSION=1.3.1
 XZ_VERSION=5.6.4
 ZSTD_VERSION=1.5.7
 
-# SHA256 of each tarball, captured 2026-08-23 by streaming the upstream URL.
-# A version bump without a hash update is a hard failure, by design: an
-# unpinned download is the easiest place to slip a backdoor into a VPN client.
-TOR_SHA256="2e6c1720118c812acf0079fd47cf91b6bfaba5d766c321c4d3d2a28d6a11a8ed"
+# SHA256 of each tarball. OpenSSL, libevent, zlib, xz and zstd were captured
+# 2026-08-23 by streaming the upstream URL. A version bump without a hash update
+# is a hard failure, by design: an unpinned download is the easiest place to
+# slip a backdoor into a VPN client.
+#
+# TOR_SHA256 is for tor-0.4.9.13.tar.gz (2026-09-23 security release). Get it
+# from https://dist.torproject.org/tor-0.4.9.13.tar.gz.sha256sum and cross-check
+# it against a second source (Debian, Arch, Buildroot) before pasting it here.
+TOR_SHA256="PUT_SHA256_OF_TOR_0_4_9_13_TARBALL_HERE"
 OPENSSL_SHA256="967311f84955316969bdb1d8d4b983718ef42338639c621ec4c34fddef355e99"
 LIBEVENT_SHA256="92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb"
 ZLIB_SHA256="9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
 XZ_SHA256="269e3f2e512cbd3314849982014dc199a7b2148cf5c91cedc6db629acdf5e09b"
 ZSTD_SHA256="eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3"
+
+# Refuse to build with an unfilled placeholder instead of failing later with a
+# confusing hash-mismatch message.
+case "$TOR_SHA256" in
+    PUT_*) echo "ERROR: TOR_SHA256 for tor-$TOR_VERSION is not filled in"; exit 1 ;;
+esac
 
 # minSdk in app/build.gradle.kts is 26; building against 24 would work but
 # leaves the binary asking for symbols we do not need to stay compatible with.
@@ -351,7 +366,7 @@ EOF
     # Do not try to *read* the version out of the binary: the first match is the
     # control protocol's "not supported by Tor 0.1.2.17 and later" warning, which
     # is also four components, so no regex shape distinguishes it. The real
-    # banner is embedded as "(on Tor 0.4.9.11 )". So assert the expected version
+    # banner is embedded as "(on Tor <version> )". So assert the expected version
     # is present rather than reporting whichever match comes first — that catches
     # a stale tarball or a cached source tree building the wrong release.
     #
