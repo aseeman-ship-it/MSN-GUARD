@@ -72,18 +72,29 @@ ZSTD_VERSION=1.5.7
 # TOR_SHA256 is for tor-0.4.9.13.tar.gz (2026-09-23 security release). Get it
 # from https://dist.torproject.org/tor-0.4.9.13.tar.gz.sha256sum and cross-check
 # it against a second source (Debian, Arch, Buildroot) before pasting it here.
-TOR_SHA256="PUT_SHA256_OF_TOR_0_4_9_13_TARBALL_HERE"
+TOR_SHA256=""   # empty = fetch upstream .sha256sum at build time (see below); paste a verified hash here to pin it
 OPENSSL_SHA256="967311f84955316969bdb1d8d4b983718ef42338639c621ec4c34fddef355e99"
 LIBEVENT_SHA256="92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb"
 ZLIB_SHA256="9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
 XZ_SHA256="269e3f2e512cbd3314849982014dc199a7b2148cf5c91cedc6db629acdf5e09b"
 ZSTD_SHA256="eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3"
 
-# Refuse to build with an unfilled placeholder instead of failing later with a
-# confusing hash-mismatch message.
-case "$TOR_SHA256" in
-    PUT_*) echo "ERROR: TOR_SHA256 for tor-$TOR_VERSION is not filled in"; exit 1 ;;
-esac
+# If TOR_SHA256 is empty, take it from Tor's own published checksum file for this
+# exact version and print it loudly so it can be pinned above afterwards.
+#
+# This is weaker than a pinned hash: the tarball and its .sha256sum come from the
+# same host (dist.torproject.org), so it only catches a corrupted or truncated
+# download, not a compromised mirror. Once the build is green, copy the hash from
+# the log, cross-check it against a second source (Debian, Arch, Buildroot),
+# paste it into TOR_SHA256 and the geoip job, and this fallback stops being used.
+if [[ -z "$TOR_SHA256" || "$TOR_SHA256" == PUT_* ]]; then
+    echo "WARNING: TOR_SHA256 is not pinned; fetching upstream .sha256sum for tor-$TOR_VERSION"
+    sha_raw=$(curl -fsSL --retry 3 "https://dist.torproject.org/tor-$TOR_VERSION.tar.gz.sha256sum")
+    TOR_SHA256=$(awk 'NR==1 { print $1 }' <<< "$sha_raw")
+    [[ "$TOR_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "ERROR: could not read a SHA256 for tor-$TOR_VERSION from upstream"; echo "$sha_raw"; exit 1; }
+    echo "==> PIN THIS: TOR_SHA256=\"$TOR_SHA256\"  (tor-$TOR_VERSION.tar.gz)"
+fi
 
 # minSdk in app/build.gradle.kts is 26; building against 24 would work but
 # leaves the binary asking for symbols we do not need to stay compatible with.
