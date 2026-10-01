@@ -48,7 +48,7 @@ jobs:
           # output stopped dead at the last make line with no error message, so
           # the step log alone cannot be trusted to contain the failure.
           set +e
-          bash -x tools/build-tor.sh arm64-v8a armeabi-v7a x86_64 > /tmp/tor-build.log 2>&1
+          bash -x tools/build-tor.sh arm64-v8a armeabi-v7a > /tmp/tor-build.log 2>&1
           rc=$?
           set -e
           echo "--- script rc=$rc, log is $(wc -l < /tmp/tor-build.log) lines ---"
@@ -142,6 +142,11 @@ jobs:
   lyrebird:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # snowflake 2.14.x needs a newer Go than lyrebird 0.8.1's own go.mod asks
+      # for. `go get` raises the go/toolchain lines in go.mod, and with auto the
+      # go command fetches that toolchain itself instead of failing the build.
+      GOTOOLCHAIN: auto
     steps:
       # Pinned to a tag, not a branch: this binary terminates the user's
       # traffic obfuscation, so it does not get to float.
@@ -162,8 +167,31 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.24'
           cache: false
+
+      # lyrebird 0.8.1 is the newest tagged release, but it pins an older
+      # Snowflake in go.mod. The Tor-side commit check above still proves the
+      # lyrebird source is exactly the tag; this step then moves ONE dependency
+      # to the Snowflake release Orbot ships, and fails the build unless Go
+      # really resolved that version. go mod verify checks the module cache
+      # against go.sum so nothing is silently swapped.
+      - name: Bump Snowflake to the pinned release
+        working-directory: lyrebird
+        run: |
+          set -euo pipefail
+          SNOWFLAKE_VERSION=v2.14.1
+          MOD=gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/v2
+          echo "before: $(go list -m -f '{{.Version}}' $MOD)"
+          go get "$MOD@$SNOWFLAKE_VERSION"
+          go mod tidy
+          go mod verify
+          GOT=$(go list -m -f '{{.Version}}' $MOD)
+          echo "after:  $GOT"
+          test "$GOT" = "$SNOWFLAKE_VERSION" \
+            || { echo "ERROR: snowflake resolved to $GOT, wanted $SNOWFLAKE_VERSION"; exit 1; }
+          go version
+          grep -E '^(go|toolchain) ' go.mod
 
       - name: Setup Android NDK
         uses: android-actions/setup-android@v3
@@ -207,9 +235,8 @@ jobs:
 
           build arm64-v8a   arm64 ""  aarch64-linux-android26-clang
           build armeabi-v7a arm   7   armv7a-linux-androideabi26-clang
-          build x86_64      amd64 ""  x86_64-linux-android26-clang
 
-          echo "==> all ABIs built"
+          echo "==> both ABIs built"
           ls -la ../out/*/libobfs4proxy.so
 
       - name: Verify PIE and page alignment
@@ -261,7 +288,7 @@ jobs:
           mkdir -p /tmp/pt_state
           set +e
           OUTPUT=$(env TOR_PT_MANAGED_TRANSPORT_VER=1 \
-                       TOR_PT_CLIENT_TRANSPORTS=obfs4,meek_lite,snowflake \
+                       TOR_PT_CLIENT_TRANSPORTS=obfs4,meek_lite,webtunnel,snowflake \
                        TOR_PT_STATE_LOCATION=/tmp/pt_state/ \
                        TOR_PT_EXIT_ON_STDIN_CLOSE=1 \
                    timeout 20 /tmp/lyrebird-host < /dev/null 2>&1)
@@ -270,13 +297,13 @@ jobs:
           # grep -q exits on first match and closes the pipe, so feeding it from
           # `echo ... |` risks SIGPIPE killing the step under pipefail. Use a
           # here-string: no pipeline, no SIGPIPE.
-          for t in obfs4 meek_lite snowflake; do
+          for t in obfs4 meek_lite webtunnel snowflake; do
             grep -q "CMETHOD $t socks5" <<< "$OUTPUT" \
               || { echo "ERROR: lyrebird did not announce $t"; exit 1; }
           done
           grep -q "CMETHODS DONE" <<< "$OUTPUT" \
             || { echo "ERROR: no CMETHODS DONE"; exit 1; }
-          echo "OK: all three transports announced"
+          echo "OK: all four transports announced"
 
       - name: Upload libobfs4proxy.so
         uses: actions/upload-artifact@v4
@@ -295,8 +322,15 @@ jobs:
       - name: Extract geoip files from the Tor tarball
         run: |
           set -euo pipefail
-          TOR_VERSION=0.4.9.11
-          EXPECTED=2e6c1720118c812acf0079fd47cf91b6bfaba5d766c321c4d3d2a28d6a11a8ed
+          # Kept in lockstep with TOR_VERSION in tools/build-tor.sh — the geoip
+          # files ship inside the same tarball libtor.so is built from, so a
+          # mismatch here would mean the country picker's data and the actual
+          # binary's Tor version quietly drift apart. Bumped 2026-09-18
+          # alongside build-tor.sh's move to the 0.4.9.12 security release;
+          # hash cross-checked against Buildroot's and Arch's packaging repos,
+          # not just this one download, for the same reason build-tor.sh does.
+          TOR_VERSION=0.4.9.12
+          EXPECTED=c0d307c9dcdaee4848a8ca53e9d6c4ec92823e4f30be12790b0fbddfc6515f5b
           curl -fL --retry 3 -o tor.tar.gz "https://dist.torproject.org/tor-$TOR_VERSION.tar.gz"
           echo "$EXPECTED  tor.tar.gz" | sha256sum -c -
           mkdir -p assets
