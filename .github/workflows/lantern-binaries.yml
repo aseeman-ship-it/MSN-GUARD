@@ -41,7 +41,9 @@ jobs:
           echo "GOPRIVATE=github.com/getlantern/*" >> $GITHUB_ENV
 
       - name: Download modules
-        run: go mod download 2>&1 | tee deps.log
+        run: |
+          set -o pipefail
+          go mod download 2>&1 | tee deps.log
 
       - name: Inspect source (report.txt)
         if: always()
@@ -55,7 +57,7 @@ jobs:
             echo "## build constraints in ipc/"; grep -rn 'go:build' ipc | head -40 || true
             echo "## tags in Makefile/justfile"; grep -n -E 'with_|-tags|TAGS' Makefile justfile 2>/dev/null | head -40 || true
             echo "## Makefile build targets"; grep -n -A6 -E '^(build-daemon|build-cli|install)' Makefile | head -60 || true
-            echo "## socks env usage"; grep -rn -E 'USE_SOCKS_PROXY|SOCKS_ADDRESS' --include=*.go . | head -20 || true
+            echo "## socks env usage";   grep -rn -E 'USE_SOCKS_PROXY|SOCKS_ADDRESS' --include=*.go . | head -20 || true
             echo "## backend API";        go doc -short ./backend 2>&1 | head -80
             echo "## LocalBackend";       go doc ./backend LocalBackend 2>&1 | head -150
             echo "## vpn API";            go doc -short ./vpn 2>&1 | head -60
@@ -69,16 +71,16 @@ jobs:
           ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" | grep -E 'aarch64-linux-android24|armv7a-linux-androideabi24' || true
 
       - name: Build arm64-v8a
-        id: arm64
         run: |
           set -o pipefail
           mkdir -p out/arm64-v8a
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$TC/aarch64-linux-android24-clang" \
           go build -v -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
-            -ldflags "-s -w -extldflags '-Wl,-z,max-page-size=16384'" \
+            -ldflags "-s -w -checklinkname=0 -extldflags '-Wl,-z,max-page-size=16384'" \
             -o out/arm64-v8a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-arm64.log
-          file out/arm64-v8a/liblantern.so; ls -lh out/arm64-v8a/liblantern.so
+          file out/arm64-v8a/liblantern.so
+          ls -lh out/arm64-v8a/liblantern.so
 
       - name: Build armeabi-v7a (allowed to fail)
         continue-on-error: true
@@ -88,8 +90,10 @@ jobs:
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           CGO_ENABLED=1 GOOS=android GOARCH=arm GOARM=7 CC="$TC/armv7a-linux-androideabi24-clang" \
           go build -v -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
-            -ldflags "-s -w" \
+            -ldflags "-s -w -checklinkname=0" \
             -o out/armeabi-v7a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-armv7.log
+          file out/armeabi-v7a/liblantern.so
+          ls -lh out/armeabi-v7a/liblantern.so
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -114,16 +118,23 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: getlantern/lantern
+
       - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: '17' }
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - uses: actions/setup-go@v5
-        with: { go-version-file: go.mod }
+        with:
+          go-version-file: go.mod
+
       - name: Official Android Go library
         run: |
           set -o pipefail
           make install-android-deps 2>&1 | tee aar-deps.log
           make build-android 2>&1 | tee aar-build.log
           find . -name '*.aar' -print | tee aar-list.txt
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
