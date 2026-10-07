@@ -4,21 +4,27 @@ on:
   workflow_dispatch:
     inputs:
       radiance_ref:
-        description: "branch, tag or commit of getlantern/radiance"
+        description: "radiance branch/tag/commit"
         default: "main"
       package:
-        description: "Go package to build"
+        description: "Go package"
         default: "./cmd/lanternd"
       build_tags:
-        description: "Go build tags (optional, space separated)"
-        default: ""
+        description: "Go build tags (comma separated)"
+        default: "with_gvisor,with_quic,with_wireguard,with_utls,with_grpc,with_clash_api,standalone"
+      try_aar:
+        description: "Also try the official gomobile AAR build (lantern repo)"
+        type: boolean
+        default: false
+
+env:
+  GH_PAT: ${{ secrets.GH_PAT }}   # optional, only for private modules
 
 jobs:
-  build:
+  binary:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout radiance
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: getlantern/radiance
           ref: ${{ inputs.radiance_ref }}
@@ -28,43 +34,102 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Show project layout
+      - name: Private modules (only if GH_PAT secret exists)
+        if: ${{ env.GH_PAT != '' }}
         run: |
-          go version
-          echo "--- cmd:"; ls cmd || true
-          echo "--- main packages:"; go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./... 2>/dev/null | grep . || true
-          echo "--- NDK: ${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-none}}"
+          git config --global url."https://${GH_PAT}@github.com/".insteadOf "https://github.com/"
+          echo "GOPRIVATE=github.com/getlantern/*" >> $GITHUB_ENV
 
       - name: Download modules
-        run: go mod download
+        run: go mod download 2>&1 | tee deps.log
 
-      - name: Build liblantern.so (arm64 + armv7)
-        env:
-          PKG: ${{ inputs.package }}
-          TAGS: ${{ inputs.build_tags }}
+      - name: Inspect source (report.txt)
+        if: always()
         run: |
-          set -euo pipefail
-          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:?NDK not found}}"
+          {
+            echo "## go version";        go version
+            echo "## go directive";      grep -n -E '^(go|toolchain) ' go.mod
+            echo "## replace lines";     grep -n '^replace' go.mod || true
+            echo "## cmd files";         find cmd -maxdepth 3 -name '*.go' | sort | head -60
+            echo "## main packages";     go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./... 2>&1 | grep . || true
+            echo "## build constraints in ipc/"; grep -rn 'go:build' ipc | head -40 || true
+            echo "## tags in Makefile/justfile"; grep -n -E 'with_|-tags|TAGS' Makefile justfile 2>/dev/null | head -40 || true
+            echo "## Makefile build targets"; grep -n -A6 -E '^(build-daemon|build-cli|install)' Makefile | head -60 || true
+            echo "## socks env usage"; grep -rn -E 'USE_SOCKS_PROXY|SOCKS_ADDRESS' --include=*.go . | head -20 || true
+            echo "## backend API";        go doc -short ./backend 2>&1 | head -80
+            echo "## LocalBackend";       go doc ./backend LocalBackend 2>&1 | head -150
+            echo "## vpn API";            go doc -short ./vpn 2>&1 | head -60
+          } > report.txt 2>&1 || true
+
+      - name: Locate NDK
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK" ]; then NDK="$(ls -d $ANDROID_HOME/ndk/* | sort -V | tail -1)"; fi
+          echo "NDK=$NDK" >> $GITHUB_ENV
+          ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" | grep -E 'aarch64-linux-android24|armv7a-linux-androideabi24' || true
+
+      - name: Build arm64-v8a
+        id: arm64
+        run: |
+          set -o pipefail
+          mkdir -p out/arm64-v8a
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          API=24
-          mkdir -p out/arm64-v8a out/armeabi-v7a
-
-          CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
-          CC="$TC/aarch64-linux-android${API}-clang" \
-          go build -trimpath -tags "$TAGS" \
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$TC/aarch64-linux-android24-clang" \
+          go build -v -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
             -ldflags "-s -w -extldflags '-Wl,-z,max-page-size=16384'" \
-            -o out/arm64-v8a/liblantern.so "$PKG"
+            -o out/arm64-v8a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-arm64.log
+          file out/arm64-v8a/liblantern.so; ls -lh out/arm64-v8a/liblantern.so
 
-          CGO_ENABLED=1 GOOS=android GOARCH=arm GOARM=7 \
-          CC="$TC/armv7a-linux-androideabi${API}-clang" \
-          go build -trimpath -tags "$TAGS" \
-            -ldflags "-s -w -extldflags '-Wl,-z,max-page-size=16384'" \
-            -o out/armeabi-v7a/liblantern.so "$PKG"
+      - name: Build armeabi-v7a (allowed to fail)
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p out/armeabi-v7a
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CGO_ENABLED=1 GOOS=android GOARCH=arm GOARM=7 CC="$TC/armv7a-linux-androideabi24-clang" \
+          go build -v -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
+            -ldflags "-s -w" \
+            -o out/armeabi-v7a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-armv7.log
 
-          file out/*/liblantern.so
-          ls -lh out/*/liblantern.so
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lantern-report-and-logs
+          path: |
+            report.txt
+            deps.log
+            build-*.log
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4
         with:
           name: liblantern
           path: out/
+
+  aar:
+    if: ${{ inputs.try_aar }}
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: getlantern/lantern
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: Official Android Go library
+        run: |
+          set -o pipefail
+          make install-android-deps 2>&1 | tee aar-deps.log
+          make build-android 2>&1 | tee aar-build.log
+          find . -name '*.aar' -print | tee aar-list.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lantern-aar
+          path: |
+            **/*.aar
+            aar-*.log
+            aar-list.txt
+          if-no-files-found: ignore
