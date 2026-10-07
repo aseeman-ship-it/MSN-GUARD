@@ -68,16 +68,20 @@ jobs:
           NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
           if [ -z "$NDK" ]; then NDK="$(ls -d $ANDROID_HOME/ndk/* | sort -V | tail -1)"; fi
           echo "NDK=$NDK" >> $GITHUB_ENV
-          ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" | grep -E 'aarch64-linux-android24|armv7a-linux-androideabi24' || true
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          ls "$TC" | grep -E 'aarch64-linux-android24|armv7a-linux-androideabi24' || true
+          test -x "$TC/aarch64-linux-android24-clang"
 
       - name: Build arm64-v8a
         run: |
           set -o pipefail
           mkdir -p out/arm64-v8a
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$TC/aarch64-linux-android24-clang" \
+          CC_BIN="$TC/aarch64-linux-android24-clang"
+          CXX_BIN="$TC/aarch64-linux-android24-clang++"
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_BIN" CXX="$CXX_BIN" \
           go build -v -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
-            -ldflags "-s -w -checklinkname=0 -extldflags '-Wl,-z,max-page-size=16384'" \
+            -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CC_BIN -extldflags '-Wl,-z,max-page-size=16384'" \
             -o out/arm64-v8a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-arm64.log
           file out/arm64-v8a/liblantern.so
           ls -lh out/arm64-v8a/liblantern.so
@@ -88,9 +92,11 @@ jobs:
           set -o pipefail
           mkdir -p out/armeabi-v7a
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          CGO_ENABLED=1 GOOS=android GOARCH=arm GOARM=7 CC="$TC/armv7a-linux-androideabi24-clang" \
+          CC_BIN="$TC/armv7a-linux-androideabi24-clang"
+          CXX_BIN="$TC/armv7a-linux-androideabi24-clang++"
+          CGO_ENABLED=1 GOOS=android GOARCH=arm GOARM=7 CC="$CC_BIN" CXX="$CXX_BIN" \
           go build -v -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
-            -ldflags "-s -w -checklinkname=0" \
+            -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CC_BIN" \
             -o out/armeabi-v7a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-armv7.log
           file out/armeabi-v7a/liblantern.so
           ls -lh out/armeabi-v7a/liblantern.so
