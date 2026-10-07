@@ -10,52 +10,61 @@ on:
         description: "Go package to build"
         default: "./cmd/lanternd"
       build_tags:
-        description: "Go build tags (space separated, optional)"
+        description: "Go build tags (optional, space separated)"
         default: ""
-      commit_to_repo:
-        description: "Copy the result into app/src/main/jniLibs and commit"
-        type: boolean
-        default: false
-
-permissions:
-  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/checkout@v4
+      - name: Checkout radiance
+        uses: actions/checkout@v4
         with:
           repository: getlantern/radiance
           ref: ${{ inputs.radiance_ref }}
-          path: radiance
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: radiance/go.mod
-          cache-dependency-path: radiance/go.sum
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
-      - name: Build liblantern.so
+      - name: Show project layout
+        run: |
+          go version
+          echo "--- cmd:"; ls cmd || true
+          echo "--- main packages:"; go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./... 2>/dev/null | grep . || true
+          echo "--- NDK: ${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-none}}"
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Build liblantern.so (arm64 + armv7)
         env:
-          BUILD_TAGS: ${{ inputs.build_tags }}
-        run: bash tools/build-lantern.sh radiance "${{ inputs.package }}"
+          PKG: ${{ inputs.package }}
+          TAGS: ${{ inputs.build_tags }}
+        run: |
+          set -euo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:?NDK not found}}"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          API=24
+          mkdir -p out/arm64-v8a out/armeabi-v7a
+
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
+          CC="$TC/aarch64-linux-android${API}-clang" \
+          go build -trimpath -tags "$TAGS" \
+            -ldflags "-s -w -extldflags '-Wl,-z,max-page-size=16384'" \
+            -o out/arm64-v8a/liblantern.so "$PKG"
+
+          CGO_ENABLED=1 GOOS=android GOARCH=arm GOARM=7 \
+          CC="$TC/armv7a-linux-androideabi${API}-clang" \
+          go build -trimpath -tags "$TAGS" \
+            -ldflags "-s -w -extldflags '-Wl,-z,max-page-size=16384'" \
+            -o out/armeabi-v7a/liblantern.so "$PKG"
+
+          file out/*/liblantern.so
+          ls -lh out/*/liblantern.so
 
       - uses: actions/upload-artifact@v4
         with:
           name: liblantern
           path: out/
-
-      - name: Commit into jniLibs
-        if: ${{ inputs.commit_to_repo }}
-        run: |
-          for abi in arm64-v8a armeabi-v7a; do
-            mkdir -p app/src/main/jniLibs/$abi
-            cp out/$abi/liblantern.so app/src/main/jniLibs/$abi/
-          done
-          git config user.name  "github-actions"
-          git config user.email "actions@users.noreply.github.com"
-          git add app/src/main/jniLibs
-          git commit -m "Update liblantern.so (radiance ${{ inputs.radiance_ref }})" || echo "nothing changed"
-          git push
