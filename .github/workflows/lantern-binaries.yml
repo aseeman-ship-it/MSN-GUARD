@@ -1,0 +1,61 @@
+name: lantern-binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      radiance_ref:
+        description: "branch, tag or commit of getlantern/radiance"
+        default: "main"
+      package:
+        description: "Go package to build"
+        default: "./cmd/lanternd"
+      build_tags:
+        description: "Go build tags (space separated, optional)"
+        default: ""
+      commit_to_repo:
+        description: "Copy the result into app/src/main/jniLibs and commit"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: getlantern/radiance
+          ref: ${{ inputs.radiance_ref }}
+          path: radiance
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: radiance/go.mod
+          cache-dependency-path: radiance/go.sum
+
+      - name: Build liblantern.so
+        env:
+          BUILD_TAGS: ${{ inputs.build_tags }}
+        run: bash tools/build-lantern.sh radiance "${{ inputs.package }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liblantern
+          path: out/
+
+      - name: Commit into jniLibs
+        if: ${{ inputs.commit_to_repo }}
+        run: |
+          for abi in arm64-v8a armeabi-v7a; do
+            mkdir -p app/src/main/jniLibs/$abi
+            cp out/$abi/liblantern.so app/src/main/jniLibs/$abi/
+          done
+          git config user.name  "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add app/src/main/jniLibs
+          git commit -m "Update liblantern.so (radiance ${{ inputs.radiance_ref }})" || echo "nothing changed"
+          git push
