@@ -69,8 +69,8 @@ jobs:
           if [ -z "$NDK" ]; then NDK="$(ls -d $ANDROID_HOME/ndk/* | sort -V | tail -1)"; fi
           echo "NDK=$NDK" >> $GITHUB_ENV
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          ls "$TC" | grep -E 'aarch64-linux-android24|armv7a-linux-androideabi24' || true
-          test -x "$TC/aarch64-linux-android24-clang"
+          ls "$TC" | grep -E '(aarch64|armv7a)-linux-android.*24-clang' || true
+          test -x "$TC/aarch64-linux-android24-clang++"
 
       - name: Build arm64-v8a
         run: |
@@ -81,7 +81,7 @@ jobs:
           CXX_BIN="$TC/aarch64-linux-android24-clang++"
           CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_BIN" CXX="$CXX_BIN" \
           go build -v -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
-            -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CC_BIN -extldflags '-Wl,-z,max-page-size=16384'" \
+            -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ -Wl,-z,max-page-size=16384'" \
             -o out/arm64-v8a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-arm64.log
           file out/arm64-v8a/liblantern.so
           ls -lh out/arm64-v8a/liblantern.so
@@ -96,7 +96,7 @@ jobs:
           CXX_BIN="$TC/armv7a-linux-androideabi24-clang++"
           CGO_ENABLED=1 GOOS=android GOARCH=arm GOARM=7 CC="$CC_BIN" CXX="$CXX_BIN" \
           go build -v -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
-            -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CC_BIN" \
+            -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++'" \
             -o out/armeabi-v7a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-armv7.log
           file out/armeabi-v7a/liblantern.so
           ls -lh out/armeabi-v7a/liblantern.so
