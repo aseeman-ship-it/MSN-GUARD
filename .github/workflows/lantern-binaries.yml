@@ -41,20 +41,20 @@ jobs:
           set -o pipefail
           go mod download 2>&1 | tee deps.log
 
-      # Everything the Android integration still has to guess is printed here:
-      # the daemon's main(), how it derives the device id, the IPC routes and
-      # socket name, and what the SOCKS switch actually keys on.
-      - name: Dump daemon source (report.txt)
+      # Read-only: collects what the Android integration still has to guess
+      # (daemon main, device id source, IPC routes, socket name, SOCKS switch)
+      # and prints it into this step's log so it can be copied from the page.
+      - name: Dump daemon source
         if: always()
         run: |
           {
             echo "## go version"; go version
-            echo "## git"; git log -1 --format='%H %cd'
-            echo; echo "## cmd/lanternd (first 400 lines per file)"
-            for f in $(ls cmd/lanternd/*.go 2>/dev/null); do echo "### $f"; head -400 "$f"; done
+            echo "## commit"; git log -1 --format='%H %cd'
+            echo; echo "## cmd/lanternd"
+            for f in $(ls cmd/lanternd/*.go 2>/dev/null | grep -v _test); do echo "### $f"; head -400 "$f"; done
             echo; echo "## common/deviceid"
             for f in $(ls common/deviceid/*.go 2>/dev/null | grep -v _test); do echo "### $f"; head -200 "$f"; done
-            echo; echo "## where Init gets its device id"
+            echo; echo "## where the device id is used"
             grep -rn "deviceid\.\|DeviceID" --include=*.go common/init.go cmd backend 2>/dev/null | head -60
             echo; echo "## ipc: routes"
             grep -rn -E 'Handle(Func)?\(|\.(Get|Post|Put|Delete)\("|Route\(|Mount\(|Endpoint *=|Path *=' --include=*.go ipc | grep -v _test | head -150
@@ -68,7 +68,10 @@ jobs:
             grep -n -E 'with_|-tags|TAGS' Makefile justfile 2>/dev/null | head -40
             echo; echo "## backend API"; go doc -short ./backend 2>&1 | head -120
           } > report.txt 2>&1 || true
-          wc -c report.txt
+          echo "report.txt: $(wc -c < report.txt) bytes"
+          echo "::group::report.txt (open to copy)"
+          cat report.txt
+          echo "::endgroup::"
 
       - name: Locate NDK
         run: |
@@ -77,6 +80,8 @@ jobs:
           echo "NDK=$NDK" >> $GITHUB_ENV
           test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
 
+      # No -v anywhere below: it prints every package name and buries the one
+      # error line that matters.
       - name: Build arm64-v8a (default) -> liblantern.so
         run: |
           set -o pipefail
@@ -85,15 +90,16 @@ jobs:
           CC_BIN="$TC/aarch64-linux-android24-clang"
           CXX_BIN="$TC/aarch64-linux-android24-clang++"
           CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_BIN" CXX="$CXX_BIN" \
-          go build -v -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
+          go build -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
             -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ -Wl,-z,max-page-size=16384'" \
             -o out/arm64-v8a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-arm64.log
           file out/arm64-v8a/liblantern.so
           ls -lh out/arm64-v8a/liblantern.so
 
-      # SOCKS-only backend (no libbox TUN). Allowed to fail: if it does not
-      # compile, build-novpn.log says why and the default build above still ships.
+      # SOCKS-only backend (no libbox TUN). May fail to compile; the next step
+      # prints exactly why, so a green job can no longer hide a missing file.
       - name: Build arm64-v8a (stealth_novpn) -> liblantern_novpn.so
+        id: novpn
         continue-on-error: true
         run: |
           set -o pipefail
@@ -101,11 +107,23 @@ jobs:
           CC_BIN="$TC/aarch64-linux-android24-clang"
           CXX_BIN="$TC/aarch64-linux-android24-clang++"
           CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_BIN" CXX="$CXX_BIN" \
-          go build -v -trimpath -buildmode=pie -tags "${{ inputs.build_tags }},stealth_novpn" \
+          go build -trimpath -buildmode=pie -tags "${{ inputs.build_tags }},stealth_novpn" \
             -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ -Wl,-z,max-page-size=16384'" \
             -o out/arm64-v8a/liblantern_novpn.so "${{ inputs.package }}" 2>&1 | tee build-novpn.log
           file out/arm64-v8a/liblantern_novpn.so
           ls -lh out/arm64-v8a/liblantern_novpn.so
+
+      - name: Result of the stealth_novpn build
+        if: always()
+        run: |
+          if [ "${{ steps.novpn.outcome }}" = "success" ]; then
+            echo "stealth_novpn: BUILT"
+          else
+            echo "stealth_novpn: FAILED. Last 60 lines of its log:"
+            echo "::group::build-novpn.log (tail)"
+            tail -60 build-novpn.log 2>/dev/null || echo "(no log)"
+            echo "::endgroup::"
+          fi
 
       - name: Build armeabi-v7a (allowed to fail)
         continue-on-error: true
@@ -116,11 +134,16 @@ jobs:
           CC_BIN="$TC/armv7a-linux-androideabi24-clang"
           CXX_BIN="$TC/armv7a-linux-androideabi24-clang++"
           CGO_ENABLED=1 GOOS=android GOARCH=arm GOARM=7 CC="$CC_BIN" CXX="$CXX_BIN" \
-          go build -v -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
+          go build -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
             -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++'" \
             -o out/armeabi-v7a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-armv7.log
           file out/armeabi-v7a/liblantern.so
           ls -lh out/armeabi-v7a/liblantern.so
+
+      - name: What was produced
+        if: always()
+        run: |
+          ls -lh out/*/ 2>/dev/null || echo "nothing in out/"
 
       - uses: actions/upload-artifact@v4
         if: always()
