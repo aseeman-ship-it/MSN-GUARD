@@ -12,10 +12,6 @@ on:
       build_tags:
         description: "Go build tags (comma separated)"
         default: "with_gvisor,with_quic,with_wireguard,with_utls,with_grpc,with_clash_api,standalone"
-      try_aar:
-        description: "Also try the official gomobile AAR build (lantern repo)"
-        type: boolean
-        default: false
 
 env:
   GH_PAT: ${{ secrets.GH_PAT }}   # optional, only for private modules
@@ -45,34 +41,43 @@ jobs:
           set -o pipefail
           go mod download 2>&1 | tee deps.log
 
-      - name: Inspect source (report.txt)
+      # Everything the Android integration still has to guess is printed here:
+      # the daemon's main(), how it derives the device id, the IPC routes and
+      # socket name, and what the SOCKS switch actually keys on.
+      - name: Dump daemon source (report.txt)
         if: always()
         run: |
           {
-            echo "## go version";        go version
-            echo "## go directive";      grep -n -E '^(go|toolchain) ' go.mod
-            echo "## replace lines";     grep -n '^replace' go.mod || true
-            echo "## cmd files";         find cmd -maxdepth 3 -name '*.go' | sort | head -60
-            echo "## main packages";     go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./... 2>&1 | grep . || true
-            echo "## build constraints in ipc/"; grep -rn 'go:build' ipc | head -40 || true
-            echo "## tags in Makefile/justfile"; grep -n -E 'with_|-tags|TAGS' Makefile justfile 2>/dev/null | head -40 || true
-            echo "## Makefile build targets"; grep -n -A6 -E '^(build-daemon|build-cli|install)' Makefile | head -60 || true
-            echo "## socks env usage";   grep -rn -E 'USE_SOCKS_PROXY|SOCKS_ADDRESS' --include=*.go . | head -20 || true
-            echo "## backend API";        go doc -short ./backend 2>&1 | head -80
-            echo "## LocalBackend";       go doc ./backend LocalBackend 2>&1 | head -150
-            echo "## vpn API";            go doc -short ./vpn 2>&1 | head -60
+            echo "## go version"; go version
+            echo "## git"; git log -1 --format='%H %cd'
+            echo; echo "## cmd/lanternd (first 400 lines per file)"
+            for f in $(ls cmd/lanternd/*.go 2>/dev/null); do echo "### $f"; head -400 "$f"; done
+            echo; echo "## common/deviceid"
+            for f in $(ls common/deviceid/*.go 2>/dev/null | grep -v _test); do echo "### $f"; head -200 "$f"; done
+            echo; echo "## where Init gets its device id"
+            grep -rn "deviceid\.\|DeviceID" --include=*.go common/init.go cmd backend 2>/dev/null | head -60
+            echo; echo "## ipc: routes"
+            grep -rn -E 'Handle(Func)?\(|\.(Get|Post|Put|Delete)\("|Route\(|Mount\(|Endpoint *=|Path *=' --include=*.go ipc | grep -v _test | head -150
+            echo; echo "## ipc: socket path"
+            grep -rn -E 'SocketPath|\.sock|Listen\(|net\.Listen|NamedPipe' --include=*.go ipc | grep -v _test | head -40
+            echo; echo "## socks / novpn switches"
+            grep -rn -E 'USE_SOCKS_PROXY|SOCKS_ADDRESS|stealth_novpn' --include=*.go --include=Makefile --include=justfile . | head -50
+            echo; echo "## env var names"
+            grep -rn -E '"RADIANCE_[A-Z_]+"' --include=*.go . | head -60
+            echo; echo "## tags in Makefile/justfile"
+            grep -n -E 'with_|-tags|TAGS' Makefile justfile 2>/dev/null | head -40
+            echo; echo "## backend API"; go doc -short ./backend 2>&1 | head -120
           } > report.txt 2>&1 || true
+          wc -c report.txt
 
       - name: Locate NDK
         run: |
           NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
           if [ -z "$NDK" ]; then NDK="$(ls -d $ANDROID_HOME/ndk/* | sort -V | tail -1)"; fi
           echo "NDK=$NDK" >> $GITHUB_ENV
-          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          ls "$TC" | grep -E '(aarch64|armv7a)-linux-android.*24-clang' || true
-          test -x "$TC/aarch64-linux-android24-clang++"
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
 
-      - name: Build arm64-v8a
+      - name: Build arm64-v8a (default) -> liblantern.so
         run: |
           set -o pipefail
           mkdir -p out/arm64-v8a
@@ -85,6 +90,22 @@ jobs:
             -o out/arm64-v8a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-arm64.log
           file out/arm64-v8a/liblantern.so
           ls -lh out/arm64-v8a/liblantern.so
+
+      # SOCKS-only backend (no libbox TUN). Allowed to fail: if it does not
+      # compile, build-novpn.log says why and the default build above still ships.
+      - name: Build arm64-v8a (stealth_novpn) -> liblantern_novpn.so
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC_BIN="$TC/aarch64-linux-android24-clang"
+          CXX_BIN="$TC/aarch64-linux-android24-clang++"
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_BIN" CXX="$CXX_BIN" \
+          go build -v -trimpath -buildmode=pie -tags "${{ inputs.build_tags }},stealth_novpn" \
+            -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ -Wl,-z,max-page-size=16384'" \
+            -o out/arm64-v8a/liblantern_novpn.so "${{ inputs.package }}" 2>&1 | tee build-novpn.log
+          file out/arm64-v8a/liblantern_novpn.so
+          ls -lh out/arm64-v8a/liblantern_novpn.so
 
       - name: Build armeabi-v7a (allowed to fail)
         continue-on-error: true
@@ -115,38 +136,3 @@ jobs:
         with:
           name: liblantern
           path: out/
-
-  aar:
-    if: ${{ inputs.try_aar }}
-    runs-on: ubuntu-24.04
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: getlantern/lantern
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Official Android Go library
-        run: |
-          set -o pipefail
-          make install-android-deps 2>&1 | tee aar-deps.log
-          make build-android 2>&1 | tee aar-build.log
-          find . -name '*.aar' -print | tee aar-list.txt
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: lantern-aar
-          path: |
-            **/*.aar
-            aar-*.log
-            aar-list.txt
-          if-no-files-found: ignore
