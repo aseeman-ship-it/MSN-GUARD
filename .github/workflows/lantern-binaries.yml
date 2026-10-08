@@ -41,36 +41,39 @@ jobs:
           set -o pipefail
           go mod download 2>&1 | tee deps.log
 
-      # Read-only: collects what the Android integration still has to guess
-      # (daemon main, device id source, IPC routes, socket name, SOCKS switch)
-      # and prints it into this step's log so it can be copied from the page.
-      - name: Dump daemon source
+      # Read-only deep dump. report.txt answered the routes question; this one
+      # answers the two that are left: where lanternd gets its device id and why
+      # the IPC socket resets every client. Download the artifact and send report2.txt.
+      - name: Dump daemon source (deep)
         if: always()
         run: |
           {
-            echo "## go version"; go version
-            echo "## commit"; git log -1 --format='%H %cd'
-            echo; echo "## cmd/lanternd"
-            for f in $(ls cmd/lanternd/*.go 2>/dev/null | grep -v _test); do echo "### $f"; head -400 "$f"; done
-            echo; echo "## common/deviceid"
-            for f in $(ls common/deviceid/*.go 2>/dev/null | grep -v _test); do echo "### $f"; head -200 "$f"; done
-            echo; echo "## where the device id is used"
-            grep -rn "deviceid\.\|DeviceID" --include=*.go common/init.go cmd backend 2>/dev/null | head -60
-            echo; echo "## ipc: routes"
-            grep -rn -E 'Handle(Func)?\(|\.(Get|Post|Put|Delete)\("|Route\(|Mount\(|Endpoint *=|Path *=' --include=*.go ipc | grep -v _test | head -150
-            echo; echo "## ipc: socket path"
-            grep -rn -E 'SocketPath|\.sock|Listen\(|net\.Listen|NamedPipe' --include=*.go ipc | grep -v _test | head -40
-            echo; echo "## socks / novpn switches"
-            grep -rn -E 'USE_SOCKS_PROXY|SOCKS_ADDRESS|stealth_novpn' --include=*.go --include=Makefile --include=justfile . | head -50
-            echo; echo "## env var names"
-            grep -rn -E '"RADIANCE_[A-Z_]+"' --include=*.go . | head -60
-            echo; echo "## tags in Makefile/justfile"
-            grep -n -E 'with_|-tags|TAGS' Makefile justfile 2>/dev/null | head -40
-            echo; echo "## backend API"; go doc -short ./backend 2>&1 | head -120
-          } > report.txt 2>&1 || true
-          echo "report.txt: $(wc -c < report.txt) bytes"
-          echo "::group::report.txt (open to copy)"
-          cat report.txt
+            echo "## lanternd.go from line 395 (runDaemon)"
+            sed -n '395,760p' cmd/lanternd/lanternd.go
+            echo; echo "## backend/radiance.go 95-270 (Options, device id)"
+            sed -n '95,270p' backend/radiance.go
+            echo; echo "## ipc: connection / auth (whole files)"
+            for f in ipc/conn_nonwindows.go ipc/socket_mobile.go ipc/socket.go; do echo "### $f"; cat "$f" 2>/dev/null; done
+            echo; echo "## ipc: anything about peers, credentials, uid, auth"
+            grep -rn -i -E 'peer|cred|getuid|\buid\b|auth|forbid|reject' --include=*.go ipc | grep -v _test | head -80
+            echo; echo "## ipc: files"; ls ipc
+            echo; echo "## ipc/server.go 128-220 (Server, middleware)"
+            sed -n '128,220p' ipc/server.go
+            echo; echo "## vpnConnectHandler"
+            grep -n "func (s \*Server) vpnConnectHandler" -A40 ipc/server.go
+            echo; echo "## novpn"
+            for f in vpn/boxoptions_novpn.go; do echo "### $f"; cat "$f" 2>/dev/null; done
+            ls vpn | grep -i novpn
+            echo; echo "## settings: DeviceIDKey / defaults"
+            grep -rn "DeviceIDKey\|DataPathKey" --include=*.go common/settings | head -20
+            echo; echo "## LocalBackend methods"
+            go doc ./backend LocalBackend 2>&1 | head -120
+            echo; echo "## Options"
+            go doc ./backend Options 2>&1 | head -60
+          } > report2.txt 2>&1 || true
+          echo "report2.txt: $(wc -c < report2.txt) bytes"
+          echo "::group::report2.txt (open to copy)"
+          cat report2.txt
           echo "::endgroup::"
 
       - name: Locate NDK
@@ -150,7 +153,7 @@ jobs:
         with:
           name: lantern-report-and-logs
           path: |
-            report.txt
+            report2.txt
             deps.log
             build-*.log
           if-no-files-found: ignore
