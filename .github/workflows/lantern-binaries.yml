@@ -92,6 +92,43 @@ jobs:
           echo "NDK=$NDK" >> $GITHUB_ENV
           test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
 
+      # Run #11 proved the SOCKS branch is in the binary, yet connect still died on Android with
+      # "create network monitor: netlink socket in Android is banned by Google". sing-box treats
+      # a failing network monitor as fatal only when route.auto_detect_interface is on. A SOCKS-only
+      # core has nothing to detect (the app excludes its own UID from the TUN), so the monitor
+      # failure must be non-fatal. Two independent patches; each one prints what it did.
+      - name: Patch - no fatal netlink network monitor
+        run: |
+          set +e
+          {
+            echo "## radiance: AutoDetectInterface before"
+            grep -rn -i "AutoDetectInterface\|auto_detect_interface" --include=*.go . | grep -v _test.go | tee patch-before.txt
+            echo "## 1) radiance: never request auto-detect"
+            grep -rl -i "AutoDetectInterface\|auto_detect_interface" --include=*.go vpn backend config 2>/dev/null | grep -v _test.go | while read -r f; do
+              perl -pi -e 's/(AutoDetectInterface\s*[:=]+\s*)true/${1}false/g; s/("auto_detect_interface"\s*:\s*)true/${1}false/g' "$f"
+              echo "patched $f"
+            done
+            echo "## radiance: after"
+            grep -rn -i "AutoDetectInterface\|auto_detect_interface" --include=*.go . | grep -v _test.go
+            echo "## 2) sing-box: make a failing network monitor non-fatal"
+            D="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' github.com/sagernet/sing-box)"
+            F="$D/route/network.go"
+            echo "sing-box dir: $D"
+            if [ -f "$F" ]; then
+              chmod -R u+w "$D" 2>/dev/null
+              echo "-- code around the error, before:"
+              grep -n -B6 -A8 'create network monitor' "$F" | head -60
+              if grep -q 'enforceInterfaceMonitor := options.AutoDetectInterface' "$F"; then
+                sed -i 's/enforceInterfaceMonitor := options.AutoDetectInterface/enforceInterfaceMonitor := false/' "$F"
+                echo "PATCHED sing-box: enforceInterfaceMonitor := false"
+              else
+                echo "::warning::route/network.go has no 'enforceInterfaceMonitor := options.AutoDetectInterface' line. Send patch-log.txt"
+              fi
+            else
+              echo "::warning::$F not found"
+            fi
+          } 2>&1 | tee patch-log.txt
+
       # No -v anywhere below: it prints every package name and buries the one error line.
       # Two attempts: full tag set first, then a slimmer one (without with_wireguard and
       # standalone) in case the SOCKS branch does not compile with them. The attempt that
@@ -207,6 +244,8 @@ jobs:
           name: lantern-report-and-logs
           path: |
             source-facts.txt
+            patch-log.txt
+            patch-before.txt
             core-info.txt
             deps.log
             build-*.log
