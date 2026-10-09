@@ -1,5 +1,14 @@
 name: lantern-binaries
 
+# Builds lanternd as liblantern_novpn.so: the SOCKS-only core the MSN Guard app needs
+# (no TUN, no netlink). The old workflow passed the tag "stealth_novpn", which does not
+# exist on radiance main, so Go silently ignored it and produced the TUN build that
+# fails on Android with "netlink socket in Android is banned by Google".
+#
+# This version (1) uses the tag radiance main really has ("novpn"), (2) proves from the
+# finished binary that the SOCKS branch is inside and the TUN branch is not, and
+# (3) fails the job if that proof fails, so a wrong core can never be shipped by accident.
+
 on:
   workflow_dispatch:
     inputs:
@@ -10,11 +19,25 @@ on:
         description: "Go package"
         default: "./cmd/lanternd"
       build_tags:
-        description: "Go build tags (comma separated)"
+        description: "Go build tags (comma separated), WITHOUT the SOCKS tag"
         default: "with_gvisor,with_quic,with_wireguard,with_utls,with_grpc,with_clash_api,standalone"
+      socks_tag:
+        description: "Tag that selects the SOCKS backend: 'novpn' on radiance main; 'stealth_novpn' only on the PR #486 branch"
+        default: "novpn"
+      build_armv7:
+        description: "Also build the armeabi-v7a SOCKS core (may fail, never blocks the job)"
+        type: boolean
+        default: true
+      build_default:
+        description: "Also build the TUN liblantern.so (the app cannot use it; leave off)"
+        type: boolean
+        default: false
 
 env:
   GH_PAT: ${{ secrets.GH_PAT }}   # optional, only for private modules
+  TAGS: ${{ inputs.build_tags }}
+  SOCKS_TAG: ${{ inputs.socks_tag }}
+  PKG: ${{ inputs.package }}
 
 jobs:
   binary:
@@ -41,39 +64,25 @@ jobs:
           set -o pipefail
           go mod download 2>&1 | tee deps.log
 
-      # Read-only deep dump. report.txt answered the routes question; this one
-      # answers the two that are left: where lanternd gets its device id and why
-      # the IPC socket resets every client. Download the artifact and send report2.txt.
-      - name: Dump daemon source (deep)
+      # Read-only facts about this exact radiance checkout: which files the SOCKS tag
+      # gates, and what the SOCKS backend does. Uploaded as source-facts.txt.
+      - name: Source facts
         if: always()
         run: |
           {
-            echo "## lanternd.go from line 395 (runDaemon)"
-            sed -n '395,760p' cmd/lanternd/lanternd.go
-            echo; echo "## backend/radiance.go 95-270 (Options, device id)"
-            sed -n '95,270p' backend/radiance.go
-            echo; echo "## ipc: connection / auth (whole files)"
-            for f in ipc/conn_nonwindows.go ipc/socket_mobile.go ipc/socket.go; do echo "### $f"; cat "$f" 2>/dev/null; done
-            echo; echo "## ipc: anything about peers, credentials, uid, auth"
-            grep -rn -i -E 'peer|cred|getuid|\buid\b|auth|forbid|reject' --include=*.go ipc | grep -v _test | head -80
-            echo; echo "## ipc: files"; ls ipc
-            echo; echo "## ipc/server.go 128-220 (Server, middleware)"
-            sed -n '128,220p' ipc/server.go
-            echo; echo "## vpnConnectHandler"
-            grep -n "func (s \*Server) vpnConnectHandler" -A40 ipc/server.go
-            echo; echo "## novpn"
-            for f in vpn/boxoptions_novpn.go; do echo "### $f"; cat "$f" 2>/dev/null; done
-            ls vpn | grep -i novpn
-            echo; echo "## settings: DeviceIDKey / defaults"
-            grep -rn "DeviceIDKey\|DataPathKey" --include=*.go common/settings | head -20
-            echo; echo "## LocalBackend methods"
-            go doc ./backend LocalBackend 2>&1 | head -120
-            echo; echo "## Options"
-            go doc ./backend Options 2>&1 | head -60
-          } > report2.txt 2>&1 || true
-          echo "report2.txt: $(wc -c < report2.txt) bytes"
-          echo "::group::report2.txt (open to copy)"
-          cat report2.txt
+            echo "## radiance commit"; git log -1 --format='%H %cd %s' 2>&1
+            echo; echo "## go"; go version
+            echo; echo "## files gated by a *novpn* build tag"
+            grep -rn -E '^//go:build.*novpn' --include=*.go . | head -60
+            echo; echo "## vpn/ files that mention novpn"; ls vpn | grep -i novpn
+            echo; echo "## vpn/boxoptions_novpn.go"; cat vpn/boxoptions_novpn.go 2>&1
+            echo; echo "## vpn/boxoptions_default.go (first 25 lines)"; sed -n '1,25p' vpn/boxoptions_default.go 2>&1
+            echo; echo "## who reads RADIANCE_SOCKS_ADDRESS / device id"
+            grep -rn "RADIANCE_SOCKS_ADDRESS\|RADIANCE_USE_SOCKS_PROXY\|RADIANCE_DEVICE_ID" --include=*.go . | head -20
+            grep -rn "DeviceIDKey" --include=*.go common/settings | head -10
+          } > source-facts.txt 2>&1 || true
+          echo "::group::source-facts.txt"
+          cat source-facts.txt
           echo "::endgroup::"
 
       - name: Locate NDK
@@ -83,52 +92,81 @@ jobs:
           echo "NDK=$NDK" >> $GITHUB_ENV
           test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
 
-      # No -v anywhere below: it prints every package name and buries the one
-      # error line that matters.
-      - name: Build arm64-v8a (default) -> liblantern.so
+      # No -v anywhere below: it prints every package name and buries the one error line.
+      # Two attempts: full tag set first, then a slimmer one (without with_wireguard and
+      # standalone) in case the SOCKS branch does not compile with them. The attempt that
+      # worked is recorded in USED_TAGS and reused for armeabi-v7a.
+      - name: Build arm64-v8a SOCKS core -> liblantern_novpn.so
         run: |
-          set -o pipefail
           mkdir -p out/arm64-v8a
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           CC_BIN="$TC/aarch64-linux-android24-clang"
           CXX_BIN="$TC/aarch64-linux-android24-clang++"
-          CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_BIN" CXX="$CXX_BIN" \
-          go build -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
-            -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ -Wl,-z,max-page-size=16384'" \
-            -o out/arm64-v8a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-arm64.log
-          file out/arm64-v8a/liblantern.so
-          ls -lh out/arm64-v8a/liblantern.so
-
-      # SOCKS-only backend (no libbox TUN). May fail to compile; the next step
-      # prints exactly why, so a green job can no longer hide a missing file.
-      - name: Build arm64-v8a (stealth_novpn) -> liblantern_novpn.so
-        id: novpn
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          CC_BIN="$TC/aarch64-linux-android24-clang"
-          CXX_BIN="$TC/aarch64-linux-android24-clang++"
-          CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_BIN" CXX="$CXX_BIN" \
-          go build -trimpath -buildmode=pie -tags "${{ inputs.build_tags }},stealth_novpn" \
-            -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ -Wl,-z,max-page-size=16384'" \
-            -o out/arm64-v8a/liblantern_novpn.so "${{ inputs.package }}" 2>&1 | tee build-novpn.log
+          build_core() {  # $1 tags, $2 log file
+            CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_BIN" CXX="$CXX_BIN" \
+            go build -trimpath -buildmode=pie -tags "$1" \
+              -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ -Wl,-z,max-page-size=16384'" \
+              -o out/arm64-v8a/liblantern_novpn.so "$PKG" > "$2" 2>&1
+          }
+          SLIM="$(echo "$TAGS" | tr ',' '\n' | grep -v -x -e with_wireguard -e standalone | paste -sd, - || true)"
+          ok=0
+          for attempt in "full|$TAGS,$SOCKS_TAG" "slim|$SLIM,$SOCKS_TAG"; do
+            name="${attempt%%|*}"; tags="${attempt#*|}"
+            echo "::group::attempt $name  tags=$tags"
+            if build_core "$tags" "build-novpn-$name.log"; then
+              echo "built OK"
+              echo "USED_TAGS=$tags" >> "$GITHUB_ENV"
+              echo "::endgroup::"
+              ok=1
+              break
+            fi
+            echo "FAILED, last 50 lines:"
+            tail -50 "build-novpn-$name.log"
+            echo "::endgroup::"
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::SOCKS core did not compile. Send build-novpn-full.log and build-novpn-slim.log (artifact lantern-report-and-logs)."
+            exit 1
+          fi
           file out/arm64-v8a/liblantern_novpn.so
           ls -lh out/arm64-v8a/liblantern_novpn.so
 
-      - name: Result of the stealth_novpn build
-        if: always()
+      # Proof from the finished binary, not from the command line:
+      #  - the Go build info must list the SOCKS tag
+      #  - the TUN option builder (boxoptions_default.go) must not be linked in
+      # core-info.txt carries the sha256: the app prints the first 16 hex digits in its log.
+      - name: Verify the core is the SOCKS build
+        id: verify
+        continue-on-error: true
         run: |
-          if [ "${{ steps.novpn.outcome }}" = "success" ]; then
-            echo "stealth_novpn: BUILT"
-          else
-            echo "stealth_novpn: FAILED. Last 60 lines of its log:"
-            echo "::group::build-novpn.log (tail)"
-            tail -60 build-novpn.log 2>/dev/null || echo "(no log)"
-            echo "::endgroup::"
+          f=out/arm64-v8a/liblantern_novpn.so
+          {
+            echo "file: $f"; sha256sum "$f"; ls -l "$f"; file "$f"
+            echo "used tags: $USED_TAGS"
+            go version -m "$f"
+          } > core-info.txt 2>&1
+          has_tag=0
+          if go version -m "$f" | grep -E 'build[[:space:]]+-tags=' | sed 's/.*-tags=//' | tr ',' '\n' | grep -qx "$SOCKS_TAG"; then has_tag=1; fi
+          tun_refs="$(strings -a "$f" | grep -c 'boxoptions_default.go' || true)"
+          socks_refs="$(strings -a "$f" | grep -c 'boxoptions_novpn.go' || true)"
+          {
+            echo "### Core check"
+            echo "| check | result |"
+            echo "|---|---|"
+            echo "| SOCKS tag \`$SOCKS_TAG\` in build info | $([ $has_tag = 1 ] && echo yes || echo NO) |"
+            echo "| TUN option builder linked in (must be 0) | $tun_refs |"
+            echo "| SOCKS option builder linked in | $socks_refs |"
+            echo "| sha256 (first 16) | $(sha256sum "$f" | cut -c1-16) |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E 'path|build[[:space:]]+(-tags|GOARCH|CGO_ENABLED|vcs\.revision)|go1\.' core-info.txt || true
+          if [ "$has_tag" != 1 ] || [ "$tun_refs" != 0 ]; then
+            echo "::error::liblantern_novpn.so is NOT a SOCKS-only build (tag present: $has_tag, TUN code references: $tun_refs)"
+            exit 1
           fi
+          echo "core OK: SOCKS-only build"
 
-      - name: Build armeabi-v7a (allowed to fail)
+      - name: Build armeabi-v7a SOCKS core (allowed to fail)
+        if: ${{ inputs.build_armv7 }}
         continue-on-error: true
         run: |
           set -o pipefail
@@ -137,11 +175,26 @@ jobs:
           CC_BIN="$TC/armv7a-linux-androideabi24-clang"
           CXX_BIN="$TC/armv7a-linux-androideabi24-clang++"
           CGO_ENABLED=1 GOOS=android GOARCH=arm GOARM=7 CC="$CC_BIN" CXX="$CXX_BIN" \
-          go build -trimpath -buildmode=pie -tags "${{ inputs.build_tags }}" \
+          go build -trimpath -buildmode=pie -tags "${USED_TAGS:-$TAGS,$SOCKS_TAG}" \
             -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++'" \
-            -o out/armeabi-v7a/liblantern.so "${{ inputs.package }}" 2>&1 | tee build-armv7.log
-          file out/armeabi-v7a/liblantern.so
-          ls -lh out/armeabi-v7a/liblantern.so
+            -o out/armeabi-v7a/liblantern_novpn.so "$PKG" 2>&1 | tee build-armv7.log
+          file out/armeabi-v7a/liblantern_novpn.so
+          ls -lh out/armeabi-v7a/liblantern_novpn.so
+
+      # Opt-in only. The TUN build cannot run in the app (needs netlink), and shipping it
+      # next to the SOCKS one invites a silent fallback to the wrong core.
+      - name: Build arm64-v8a TUN core -> liblantern.so (opt-in)
+        if: ${{ inputs.build_default }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC_BIN="$TC/aarch64-linux-android24-clang"
+          CXX_BIN="$TC/aarch64-linux-android24-clang++"
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_BIN" CXX="$CXX_BIN" \
+          go build -trimpath -buildmode=pie -tags "$TAGS" \
+            -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ -Wl,-z,max-page-size=16384'" \
+            -o out/arm64-v8a/liblantern.so "$PKG" 2>&1 | tee build-arm64-default.log
 
       - name: What was produced
         if: always()
@@ -153,12 +206,21 @@ jobs:
         with:
           name: lantern-report-and-logs
           path: |
-            report2.txt
+            source-facts.txt
+            core-info.txt
             deps.log
             build-*.log
           if-no-files-found: ignore
 
+      # Only a verified SOCKS core is published as the "liblantern" artifact.
       - uses: actions/upload-artifact@v4
+        if: ${{ steps.verify.outcome == 'success' }}
         with:
           name: liblantern
           path: out/
+
+      - name: Fail the job if the core is not the SOCKS build
+        if: ${{ always() && steps.verify.outcome == 'failure' }}
+        run: |
+          echo "::error::Core verification failed: nothing was published as 'liblantern'. See core-info.txt and source-facts.txt in lantern-report-and-logs."
+          exit 1
