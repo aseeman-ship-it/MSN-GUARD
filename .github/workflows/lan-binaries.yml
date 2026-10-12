@@ -1,14 +1,6 @@
 name: lantern-binaries
 
-# Builds lanternd as liblantern_novpn.so: the SOCKS-only core the MSN Guard app needs
-# (no TUN, no netlink), for every Android ABI the app may run on:
-#   arm64-v8a (required), armeabi-v7a, x86_64 (+ optional x86).
-#
-# arm64-v8a is the mandatory ABI: if it fails, the job fails.
-# The other ABIs never block the job (continue-on-error), but every binary that
-# WAS produced is verified from the finished file: the SOCKS tag must be in the Go
-# build info and the TUN option builder must not be linked in. If any produced
-# binary fails that proof, nothing is published as "liblantern".
+
 
 on:
   workflow_dispatch:
