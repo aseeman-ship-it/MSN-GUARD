@@ -1,13 +1,14 @@
 name: lantern-binaries
 
 # Builds lanternd as liblantern_novpn.so: the SOCKS-only core the MSN Guard app needs
-# (no TUN, no netlink). The old workflow passed the tag "stealth_novpn", which does not
-# exist on radiance main, so Go silently ignored it and produced the TUN build that
-# fails on Android with "netlink socket in Android is banned by Google".
+# (no TUN, no netlink), for every Android ABI the app may run on:
+#   arm64-v8a (required), armeabi-v7a, x86_64 (+ optional x86).
 #
-# This version (1) uses the tag radiance main really has ("novpn"), (2) proves from the
-# finished binary that the SOCKS branch is inside and the TUN branch is not, and
-# (3) fails the job if that proof fails, so a wrong core can never be shipped by accident.
+# arm64-v8a is the mandatory ABI: if it fails, the job fails.
+# The other ABIs never block the job (continue-on-error), but every binary that
+# WAS produced is verified from the finished file: the SOCKS tag must be in the Go
+# build info and the TUN option builder must not be linked in. If any produced
+# binary fails that proof, nothing is published as "liblantern".
 
 on:
   workflow_dispatch:
@@ -25,9 +26,17 @@ on:
         description: "Tag that selects the SOCKS backend: 'novpn' on radiance main; 'stealth_novpn' only on the PR #486 branch"
         default: "novpn"
       build_armv7:
-        description: "Also build the armeabi-v7a SOCKS core (may fail, never blocks the job)"
+        description: "Also build armeabi-v7a (32-bit ARM). May fail, never blocks the job"
         type: boolean
         default: true
+      build_x86_64:
+        description: "Also build x86_64 (emulators, Chromebooks, some tablets). May fail, never blocks the job"
+        type: boolean
+        default: true
+      build_x86:
+        description: "Also build x86 (32-bit, old emulators). May fail, never blocks the job"
+        type: boolean
+        default: false
       build_default:
         description: "Also build the TUN liblantern.so (the app cannot use it; leave off)"
         type: boolean
@@ -129,97 +138,137 @@ jobs:
             fi
           } 2>&1 | tee patch-log.txt
 
-      # No -v anywhere below: it prints every package name and buries the one error line.
-      # Two attempts: full tag set first, then a slimmer one (without with_wireguard and
-      # standalone) in case the SOCKS branch does not compile with them. The attempt that
-      # worked is recorded in USED_TAGS and reused for armeabi-v7a.
-      - name: Build arm64-v8a SOCKS core -> liblantern_novpn.so
+      # One shared build script for every ABI, so all of them are built the same way:
+      #   ./ci-build-core.sh <abi>      abi = arm64-v8a | armeabi-v7a | x86_64 | x86
+      # Two attempts: the full tag set first, then a slimmer one (without with_wireguard and
+      # standalone) in case the SOCKS branch does not compile with them. The tag set that
+      # worked for the first ABI (arm64-v8a) is recorded in USED_TAGS and tried first for the
+      # next ABIs. No -v: it prints every package name and buries the one error line.
+      - name: Prepare build helper
         run: |
-          mkdir -p out/arm64-v8a
+          cat > ci-build-core.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          ABI="$1"
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          CC_BIN="$TC/aarch64-linux-android24-clang"
-          CXX_BIN="$TC/aarch64-linux-android24-clang++"
+          PAGE=""
+          case "$ABI" in
+            arm64-v8a)   GOARCH_=arm64; GOARM_="";  CLANG="aarch64-linux-android24-clang";     PAGE="-Wl,-z,max-page-size=16384" ;;
+            armeabi-v7a) GOARCH_=arm;   GOARM_="7"; CLANG="armv7a-linux-androideabi24-clang"   ;;
+            x86_64)      GOARCH_=amd64; GOARM_="";  CLANG="x86_64-linux-android24-clang";      PAGE="-Wl,-z,max-page-size=16384" ;;
+            x86)         GOARCH_=386;   GOARM_="";  CLANG="i686-linux-android24-clang"         ;;
+            *) echo "::error::unknown ABI $ABI"; exit 2 ;;
+          esac
+          CC_BIN="$TC/$CLANG"
+          CXX_BIN="$TC/${CLANG}++"
+          if [ ! -x "$CXX_BIN" ]; then echo "::error::NDK has no $CLANG++"; exit 1; fi
+          OUT="out/$ABI/liblantern_novpn.so"
+          mkdir -p "out/$ABI"
+
           build_core() {  # $1 tags, $2 log file
-            CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_BIN" CXX="$CXX_BIN" \
+            CGO_ENABLED=1 GOOS=android GOARCH="$GOARCH_" GOARM="$GOARM_" CC="$CC_BIN" CXX="$CXX_BIN" \
             go build -trimpath -buildmode=pie -tags "$1" \
-              -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ -Wl,-z,max-page-size=16384'" \
-              -o out/arm64-v8a/liblantern_novpn.so "$PKG" > "$2" 2>&1
+              -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ $PAGE'" \
+              -o "$OUT" "$PKG" > "$2" 2>&1
           }
-          SLIM="$(echo "$TAGS" | tr ',' '\n' | grep -v -x -e with_wireguard -e standalone | paste -sd, - || true)"
+
+          FULL="$TAGS,$SOCKS_TAG"
+          SLIM="$(echo "$TAGS" | tr ',' '\n' | grep -v -x -e with_wireguard -e standalone | paste -sd, - || true),$SOCKS_TAG"
+          FIRST="${USED_TAGS:-$FULL}"
+
           ok=0
-          for attempt in "full|$TAGS,$SOCKS_TAG" "slim|$SLIM,$SOCKS_TAG"; do
+          for attempt in "first|$FIRST" "slim|$SLIM"; do
             name="${attempt%%|*}"; tags="${attempt#*|}"
-            echo "::group::attempt $name  tags=$tags"
-            if build_core "$tags" "build-novpn-$name.log"; then
+            # do not retry the same tag set twice
+            if [ "$name" = slim ] && [ "$tags" = "$FIRST" ]; then continue; fi
+            echo "::group::$ABI attempt $name  tags=$tags"
+            if build_core "$tags" "build-$ABI-$name.log"; then
               echo "built OK"
-              echo "USED_TAGS=$tags" >> "$GITHUB_ENV"
+              echo "$tags" > "out/$ABI/.used_tags"
+              if [ -z "${USED_TAGS:-}" ]; then echo "USED_TAGS=$tags" >> "$GITHUB_ENV"; fi
               echo "::endgroup::"
               ok=1
               break
             fi
             echo "FAILED, last 50 lines:"
-            tail -50 "build-novpn-$name.log"
+            tail -50 "build-$ABI-$name.log"
             echo "::endgroup::"
           done
           if [ "$ok" != 1 ]; then
-            echo "::error::SOCKS core did not compile. Send build-novpn-full.log and build-novpn-slim.log (artifact lantern-report-and-logs)."
+            rm -f "$OUT"
+            echo "::error::$ABI SOCKS core did not compile. See build-$ABI-*.log (artifact lantern-report-and-logs)."
             exit 1
           fi
-          file out/arm64-v8a/liblantern_novpn.so
-          ls -lh out/arm64-v8a/liblantern_novpn.so
+          file "$OUT"
+          ls -lh "$OUT"
+          EOF
+          chmod +x ci-build-core.sh
 
-      # Proof from the finished binary, not from the command line:
-      #  - the Go build info must list the SOCKS tag
-      #  - the TUN option builder (boxoptions_default.go) must not be linked in
-      # core-info.txt carries the sha256: the app prints the first 16 hex digits in its log.
-      - name: Verify the core is the SOCKS build
-        id: verify
+      - name: Build arm64-v8a SOCKS core -> liblantern_novpn.so (required)
+        run: ./ci-build-core.sh arm64-v8a
+
+      - name: Build x86_64 SOCKS core (allowed to fail)
+        if: ${{ inputs.build_x86_64 }}
         continue-on-error: true
-        run: |
-          f=out/arm64-v8a/liblantern_novpn.so
-          {
-            echo "file: $f"; sha256sum "$f"; ls -l "$f"; file "$f"
-            echo "used tags: $USED_TAGS"
-            go version -m "$f"
-          } > core-info.txt 2>&1
-          has_tag=0
-          if go version -m "$f" | grep -E 'build[[:space:]]+-tags=' | sed 's/.*-tags=//' | tr ',' '\n' | grep -qx "$SOCKS_TAG"; then has_tag=1; fi
-          tun_refs="$(strings -a "$f" | grep -c 'boxoptions_default.go' || true)"
-          socks_refs="$(strings -a "$f" | grep -c 'boxoptions_novpn.go' || true)"
-          {
-            echo "### Core check"
-            echo "| check | result |"
-            echo "|---|---|"
-            echo "| SOCKS tag \`$SOCKS_TAG\` in build info | $([ $has_tag = 1 ] && echo yes || echo NO) |"
-            echo "| TUN option builder linked in (must be 0) | $tun_refs |"
-            echo "| SOCKS option builder linked in | $socks_refs |"
-            echo "| sha256 (first 16) | $(sha256sum "$f" | cut -c1-16) |"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          grep -E 'path|build[[:space:]]+(-tags|GOARCH|CGO_ENABLED|vcs\.revision)|go1\.' core-info.txt || true
-          if [ "$has_tag" != 1 ] || [ "$tun_refs" != 0 ]; then
-            echo "::error::liblantern_novpn.so is NOT a SOCKS-only build (tag present: $has_tag, TUN code references: $tun_refs)"
-            exit 1
-          fi
-          echo "core OK: SOCKS-only build"
+        run: ./ci-build-core.sh x86_64
 
       - name: Build armeabi-v7a SOCKS core (allowed to fail)
         if: ${{ inputs.build_armv7 }}
         continue-on-error: true
+        run: ./ci-build-core.sh armeabi-v7a
+
+      - name: Build x86 SOCKS core (allowed to fail)
+        if: ${{ inputs.build_x86 }}
+        continue-on-error: true
+        run: ./ci-build-core.sh x86
+
+      # Proof from each finished binary, not from the command line:
+      #  - the Go build info must list the SOCKS tag
+      #  - the TUN option builder (boxoptions_default.go) must not be linked in
+      # core-info.txt carries the sha256: the app prints the first 16 hex digits in its log.
+      # Every binary that exists is checked; one bad binary fails the whole step, so a
+      # wrong core can never be published next to the good ones.
+      - name: Verify every core is the SOCKS build
+        id: verify
+        continue-on-error: true
         run: |
-          set -o pipefail
-          mkdir -p out/armeabi-v7a
-          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          CC_BIN="$TC/armv7a-linux-androideabi24-clang"
-          CXX_BIN="$TC/armv7a-linux-androideabi24-clang++"
-          CGO_ENABLED=1 GOOS=android GOARCH=arm GOARM=7 CC="$CC_BIN" CXX="$CXX_BIN" \
-          go build -trimpath -buildmode=pie -tags "${USED_TAGS:-$TAGS,$SOCKS_TAG}" \
-            -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++'" \
-            -o out/armeabi-v7a/liblantern_novpn.so "$PKG" 2>&1 | tee build-armv7.log
-          file out/armeabi-v7a/liblantern_novpn.so
-          ls -lh out/armeabi-v7a/liblantern_novpn.so
+          : > core-info.txt
+          {
+            echo "### Core check"
+            echo "| ABI | SOCKS tag \`$SOCKS_TAG\` in build info | TUN builder linked (must be 0) | SOCKS builder linked | sha256 (first 16) |"
+            echo "|---|---|---|---|---|"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          bad=0
+          found=0
+          for f in out/*/liblantern_novpn.so; do
+            [ -f "$f" ] || continue
+            found=$((found+1))
+            abi="$(basename "$(dirname "$f")")"
+            {
+              echo "=================== $abi"
+              echo "file: $f"; sha256sum "$f"; ls -l "$f"; file "$f"
+              echo "used tags: $(cat "out/$abi/.used_tags" 2>/dev/null)"
+              go version -m "$f"
+            } >> core-info.txt 2>&1
+            has_tag=0
+            if go version -m "$f" | grep -E 'build[[:space:]]+-tags=' | sed 's/.*-tags=//' | tr ',' '\n' | grep -qx "$SOCKS_TAG"; then has_tag=1; fi
+            tun_refs="$(strings -a "$f" | grep -c 'boxoptions_default.go' || true)"
+            socks_refs="$(strings -a "$f" | grep -c 'boxoptions_novpn.go' || true)"
+            echo "| $abi | $([ $has_tag = 1 ] && echo yes || echo NO) | $tun_refs | $socks_refs | $(sha256sum "$f" | cut -c1-16) |" | tee -a "$GITHUB_STEP_SUMMARY"
+            if [ "$has_tag" != 1 ] || [ "$tun_refs" != 0 ]; then
+              echo "::error::$abi liblantern_novpn.so is NOT a SOCKS-only build (tag present: $has_tag, TUN code references: $tun_refs)"
+              bad=1
+            fi
+          done
+          grep -E 'path|build[[:space:]]+(-tags|GOARCH|CGO_ENABLED|vcs\.revision)|go1\.|^=====' core-info.txt || true
+          if [ "$found" = 0 ]; then echo "::error::no core was built"; exit 1; fi
+          if [ ! -f out/arm64-v8a/liblantern_novpn.so ]; then echo "::error::the required arm64-v8a core is missing"; exit 1; fi
+          if [ "$bad" != 0 ]; then exit 1; fi
+          echo "all $found core(s) OK: SOCKS-only build"
 
       # Opt-in only. The TUN build cannot run in the app (needs netlink), and shipping it
       # next to the SOCKS one invites a silent fallback to the wrong core.
+      # Built AFTER verification so it can never influence the SOCKS check.
       - name: Build arm64-v8a TUN core -> liblantern.so (opt-in)
         if: ${{ inputs.build_default }}
         continue-on-error: true
@@ -236,6 +285,7 @@ jobs:
       - name: What was produced
         if: always()
         run: |
+          rm -f out/*/.used_tags
           ls -lh out/*/ 2>/dev/null || echo "nothing in out/"
 
       - uses: actions/upload-artifact@v4
@@ -251,14 +301,15 @@ jobs:
             build-*.log
           if-no-files-found: ignore
 
-      # Only a verified SOCKS core is published as the "liblantern" artifact.
+      # Only verified SOCKS cores are published as the "liblantern" artifact.
+      # Layout: out/<abi>/liblantern_novpn.so  ->  jniLibs/<abi>/ in the app.
       - uses: actions/upload-artifact@v4
         if: ${{ steps.verify.outcome == 'success' }}
         with:
           name: liblantern
           path: out/
 
-      - name: Fail the job if the core is not the SOCKS build
+      - name: Fail the job if a core is not the SOCKS build
         if: ${{ always() && steps.verify.outcome == 'failure' }}
         run: |
           echo "::error::Core verification failed: nothing was published as 'liblantern'. See core-info.txt and source-facts.txt in lantern-report-and-logs."
